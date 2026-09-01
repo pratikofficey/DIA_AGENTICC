@@ -1,0 +1,317 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>DIA — P2P Invoice Analytics</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+<div class="app-shell">
+
+  <!-- ── Sidebar ── -->
+  <aside class="sidebar">
+    <div class="sb-logo">
+      <div class="sb-logo-mark">D</div>
+      <div>
+        <div class="sb-logo-name">DIA</div>
+        <div class="sb-logo-sub">P2P Analytics</div>
+      </div>
+    </div>
+
+    <nav class="sb-nav">
+      <a class="sb-link active" href="#uploadCard" onclick="sbNav(this)">
+        <span class="sb-icon">⬆</span> Upload
+      </a>
+      <div class="sb-group-label">Results</div>
+      <a class="sb-link" href="#secSummary" onclick="sbNav(this)">
+        <span class="sb-icon">◎</span> Summary
+      </a>
+      <a class="sb-link" href="#secMapping" onclick="sbNav(this)">
+        <span class="sb-icon">⇄</span> Schema Mapping
+      </a>
+      <a class="sb-link" href="#secCompleteness" onclick="sbNav(this)">
+        <span class="sb-icon">▦</span> Completeness
+      </a>
+      <a class="sb-link" href="#secIssues" onclick="sbNav(this)">
+        <span class="sb-icon">⚠</span> Issues
+      </a>
+      <div class="sb-divider"></div>
+      <a class="sb-link" href="#testsSection" onclick="sbNav(this)">
+        <span class="sb-icon">⊞</span> Analytics Tests
+      </a>
+      <a class="sb-link" href="#opsSection" onclick="sbNav(this)">
+        <span class="sb-icon">◈</span> Operations
+      </a>
+      <div class="sb-divider"></div>
+      <a class="sb-link" href="/review" id="reviewLink" style="display:none">
+        <span class="sb-icon">◎</span> Review Queue
+      </a>
+    </nav>
+
+    <div class="sb-bottom">
+      <div id="sbRunInfo" class="sb-run-info" style="display:none">
+        <div class="sb-run-label">Current Run</div>
+        <div class="sb-run-id" id="sbRunId">—</div>
+        <div class="sb-run-file" id="sbRunFile">—</div>
+        <div class="sb-run-rows" id="sbRunRows"></div>
+      </div>
+      <div id="pendingAlert" onclick="openPending()">
+        ⚠ <span id="pendingCount">0</span> mappings need review
+      </div>
+      <button id="newRunBtn" onclick="startNewRun()" style="display:none;margin:0 12px 12px;width:calc(100% - 24px);background:#1e293b;border:1px solid #334155;color:#94a3b8;border-radius:7px;padding:7px;font-size:12px;cursor:pointer;font-family:inherit;transition:all .15s" onmouseover="this.style.borderColor='#ef4444';this.style.color='#f87171'" onmouseout="this.style.borderColor='#334155';this.style.color='#94a3b8'">↺ Start New Run</button>
+    </div>
+  </aside>
+
+  <!-- ── Main ── -->
+  <div class="main-wrap">
+    <div class="topbar">
+      <div class="topbar-title" id="topbarTitle">Invoice Validation &amp; Analytics</div>
+      <span id="statusMsg"></span>
+    </div>
+
+    <main>
+
+      <!-- Upload -->
+      <div class="card upload-card" id="uploadCard">
+        <div class="card-title">Upload Invoice Data</div>
+        <div class="card-sub">Drop your ERP export CSV — columns are auto-mapped, validated, and analytics tests run automatically.</div>
+
+        <div class="upload-zone" id="dropZone" onclick="document.getElementById('fileInput').click()">
+          <div class="uz-icon">📂</div>
+          <div class="uz-hint" id="dropHint">Click to choose a CSV file, or drag &amp; drop</div>
+          <div class="uz-fname" id="dropName"></div>
+        </div>
+        <input type="file" id="fileInput" accept=".csv" style="display:none" />
+
+        <div class="upload-controls">
+          <select id="erpType" class="form-select">
+            <option value="">Auto-detect ERP</option>
+            <option value="SAP">SAP</option>
+            <option value="Oracle">Oracle</option>
+            <option value="Tally">Tally</option>
+            <option value="Dynamics">Microsoft Dynamics</option>
+          </select>
+
+          <div class="toggle-wrap" onclick="toggleLLM()">
+            <div class="toggle" id="llmToggle"></div>
+            <span>AI mapping fallback</span>
+          </div>
+
+          <label class="toggle-wrap">
+            <input type="checkbox" id="bgMode" style="width:14px;height:14px;accent-color:#2563eb" />
+            <span>Background mode</span>
+          </label>
+
+          <button class="btn-primary" id="runBtn" onclick="runValidation()">Validate</button>
+        </div>
+      </div>
+
+      <!-- Results -->
+      <div id="results" style="display:none">
+
+        <!-- Summary -->
+        <div class="card" id="secSummary">
+          <div class="section-head open" onclick="toggle(this)">
+            <span class="s-icon">◎</span>
+            <span class="s-title">Validation Summary</span>
+            <span class="s-meta" id="summaryMeta"></span>
+            <span class="chevron">▾</span>
+          </div>
+          <div class="section-body">
+            <div id="erpBanner" class="erp-banner" style="display:none"></div>
+            <div class="summary-grid">
+              <div class="ring-wrap">
+                <svg width="110" height="110" viewBox="0 0 110 110">
+                  <circle cx="55" cy="55" r="46" fill="none" stroke="#e2e8f0" stroke-width="10"/>
+                  <circle cx="55" cy="55" r="46" fill="none" stroke="#059669" stroke-width="10"
+                    stroke-dasharray="289" id="ringFill" stroke-dashoffset="289"
+                    stroke-linecap="round"
+                    style="transition:stroke-dashoffset .9s;transform:rotate(-90deg);transform-origin:55px 55px"/>
+                </svg>
+                <div class="ring-label"><span id="ringPct">—</span><small>pass rate</small></div>
+              </div>
+              <div class="kpi-bar" style="flex:1">
+                <div class="kpi">       <div class="k-label">Total Rows</div>   <div class="k-val" id="kTotal">—</div></div>
+                <div class="kpi green"> <div class="k-label">Clean</div>         <div class="k-val" id="kClean">—</div></div>
+                <div class="kpi red">   <div class="k-label">With Errors</div>   <div class="k-val" id="kErrRows">—</div></div>
+                <div class="kpi red">   <div class="k-label">Errors</div>        <div class="k-val" id="kErrors">—</div></div>
+                <div class="kpi amber"> <div class="k-label">Warnings</div>      <div class="k-val" id="kWarn">—</div></div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Schema Mapping -->
+        <div class="card" id="secMapping">
+          <div class="section-head open" onclick="toggle(this)">
+            <span class="s-icon">⇄</span>
+            <span class="s-title">Schema Mapping</span>
+            <span class="s-meta" id="mappingMeta"></span>
+            <span class="chevron">▾</span>
+          </div>
+          <div class="section-body">
+            <table>
+              <thead><tr><th>Uploaded Column</th><th>Mapped To (UDM)</th><th>Method</th><th>Status</th></tr></thead>
+              <tbody id="mappingBody"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- Completeness -->
+        <div class="card" id="secCompleteness">
+          <div class="section-head" onclick="toggle(this)">
+            <span class="s-icon">▦</span>
+            <span class="s-title">Field Completeness</span>
+            <span class="s-meta" id="compMeta"></span>
+            <span class="chevron">▾</span>
+          </div>
+          <div class="section-body" style="display:none">
+            <div class="comp-grid" id="compGrid"></div>
+          </div>
+        </div>
+
+        <!-- Validation Issues -->
+        <div class="card" id="secIssues">
+          <div class="section-head" onclick="toggle(this)">
+            <span class="s-icon">⚠</span>
+            <span class="s-title">Validation Issues</span>
+            <span class="s-meta" id="issuesMeta"></span>
+            <span class="chevron">▾</span>
+          </div>
+          <div class="section-body" style="display:none">
+            <div id="severityStrip" class="sev-strip"></div>
+            <div class="sec-label">Click a rule to inspect rows</div>
+            <div id="ruleCardGrid" class="rule-grid"></div>
+            <div id="drillPanel" class="drill-panel" style="display:none">
+              <div class="drill-head">
+                <span id="drillTitle" style="flex:1;font-size:13px;font-weight:700;color:#0f172a"></span>
+                <button onclick="closeDrill()" class="btn-icon">✕ Close</button>
+              </div>
+              <table>
+                <thead><tr><th>Invoice ID</th><th>Field</th><th>Issue</th></tr></thead>
+                <tbody id="drillBody"></tbody>
+              </table>
+              <div id="drillMore" class="hint-text" style="margin-top:8px;display:none"></div>
+            </div>
+            <div id="implWrap" style="display:none;margin-top:20px">
+              <div class="sec-label" style="margin-bottom:10px">Auto-fill Suggestions</div>
+              <table>
+                <thead><tr><th>Row</th><th>Field</th><th>Suggested Value</th><th>Logic</th></tr></thead>
+                <tbody id="implBody"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <!-- Analytics Tests -->
+        <div class="card" id="testsSection" style="display:none">
+          <div class="section-head open" onclick="toggle(this)">
+            <span class="s-icon">⊞</span>
+            <span class="s-title">Analytics Tests</span>
+            <span class="s-meta" id="testsMeta"></span>
+            <span class="chevron">▾</span>
+          </div>
+          <div class="section-body">
+            <div class="test-bar">
+              <div class="test-stat"><strong id="tsApplicable">0</strong> available</div>
+              <div class="test-stat muted"><strong id="tsNotApplicable">0</strong> need extra data</div>
+              <div style="flex:1"></div>
+              <label class="toggle-wrap" style="font-size:12px;gap:6px">
+                <input type="checkbox" id="selectAllTests" checked onchange="toggleSelectAll(this.checked)" style="width:13px;height:13px;accent-color:#2563eb"/>
+                <span>All</span>
+              </label>
+              <button class="btn-run-tests" id="runTestsBtn" onclick="runSelectedTests()">Run Selected Tests</button>
+              <span id="testRunStatus" class="hint-text"></span>
+            </div>
+
+            <div class="test-list" id="testList"></div>
+
+            <div class="na-section" id="naSectionWrap" style="display:none">
+              <span class="na-toggle" onclick="toggleNA()">▶ Show tests needing additional data (<span id="naCount">0</span>)</span>
+              <div class="na-list" id="naList" style="display:none"></div>
+            </div>
+
+            <div id="testResultsWrap" style="display:none;margin-top:22px">
+              <div class="results-header">
+                <span class="results-title">Test Results</span>
+                <div id="testResultsBar" class="results-stats"></div>
+              </div>
+              <div class="test-results-grid" id="testResultsGrid"></div>
+              <div class="test-drill" id="testDrillPanel" style="display:none">
+                <div class="drill-head">
+                  <span class="td-title" id="testDrillTitle" style="flex:1"></span>
+                  <button onclick="closeTestDrill()" class="btn-icon">✕ Close</button>
+                </div>
+                <div id="testDrillSummary" class="hint-text" style="margin-bottom:12px"></div>
+                <table>
+                  <thead><tr><th>Invoice ID</th><th>Vendor</th><th>Invoice No</th><th>Date</th><th>Amount</th><th>Description</th></tr></thead>
+                  <tbody id="testDrillBody"></tbody>
+                </table>
+                <div id="testDrillMore" class="hint-text" style="margin-top:8px;display:none"></div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Operations -->
+        <div class="card" id="opsSection" style="display:none">
+          <div class="section-head" onclick="toggle(this)">
+            <span class="s-icon">◈</span>
+            <span class="s-title">Operations &amp; Cross-run Insights</span>
+            <span class="s-meta" id="opsMeta"></span>
+            <span class="chevron">▾</span>
+          </div>
+          <div class="section-body" style="display:none">
+            <div id="opsAlerts" class="ops-alerts"></div>
+            <div class="kpi-bar">
+              <div class="kpi">       <div class="k-label">Avg Runtime</div>          <div class="k-val" id="opsAvgRuntime">—</div></div>
+              <div class="kpi amber"> <div class="k-label">Parse Error Rate</div>     <div class="k-val" id="opsParseRate">—</div></div>
+              <div class="kpi green"> <div class="k-label">Mapping Coverage</div>     <div class="k-val" id="opsCoverage">—</div></div>
+            </div>
+            <div class="ops-tables">
+              <div>
+                <div class="sec-label">Phase Breakdown</div>
+                <table><thead><tr><th>Phase</th><th>Avg ms</th></tr></thead><tbody id="opsPhaseBody"></tbody></table>
+              </div>
+              <div>
+                <div class="sec-label">Top Vendors Across Runs</div>
+                <table><thead><tr><th>Vendor</th><th>Invoices</th><th>Amount</th><th>Runs</th></tr></thead><tbody id="opsVendorBody"></tbody></table>
+              </div>
+              <div>
+                <div class="sec-label">Month Spikes</div>
+                <table><thead><tr><th>Month</th><th>Vendor</th><th>Amount</th><th>Ratio</th></tr></thead><tbody id="opsSpikeBody"></tbody></table>
+              </div>
+            </div>
+          </div>
+        </div>
+
+      </div><!-- /results -->
+    </main>
+  </div><!-- /main-wrap -->
+</div><!-- /app-shell -->
+
+<!-- Mapping Review Modal -->
+<div class="overlay" id="overlay" onclick="if(event.target===this)closePending()">
+  <div class="modal">
+    <div class="modal-head">
+      <h3>Mapping Review</h3>
+      <button class="btn-icon" onclick="closePending()">✕</button>
+    </div>
+    <p class="hint-text" style="margin-bottom:16px">
+      All mapped columns from this upload. Confirm to persist to registry.
+      <span style="background:#fffbeb;padding:1px 6px;border-radius:4px;font-size:11px;color:#92400e">Amber rows</span> are inferred and need attention.
+    </p>
+    <table>
+      <thead><tr><th>Source Column</th><th>UDM Field</th><th>Method</th><th>Status</th><th></th></tr></thead>
+      <tbody id="pendingBody"></tbody>
+    </table>
+    <div id="pendingEmpty" class="empty" style="display:none">All mappings reviewed ✓</div>
+  </div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

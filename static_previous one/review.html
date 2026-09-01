@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>DIA — Review Queue</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/style.css" />
+  <link rel="stylesheet" href="/static/review.css" />
+</head>
+<body>
+<div class="rv-shell">
+
+  <!-- ── Top bar ── -->
+  <header class="rv-topbar">
+    <div class="rv-topbar-left">
+      <a href="/" class="rv-back" onclick="if(history.length>1){event.preventDefault();history.back()}">← Back</a>
+      <div class="rv-logo-mark">D</div>
+      <div class="rv-title">Review Queue</div>
+      <select id="runSelect" class="rv-run-select" onchange="loadRun(this.value)">
+        <option value="">Select a run…</option>
+      </select>
+    </div>
+    <div class="rv-topbar-right">
+      <div id="rvProgress" class="rv-progress-wrap" style="display:none">
+        <div class="rv-progress-bar-bg">
+          <div class="rv-progress-bar-fill" id="rvProgressFill"></div>
+        </div>
+        <span id="rvProgressLabel" class="rv-progress-label"></span>
+      </div>
+      <button class="rv-btn-secondary" id="bulkFpBtn" onclick="bulkAction('false_positive')" style="display:none">Mark Selected False Positive</button>
+      <button class="rv-btn-primary" id="bulkConfirmBtn" onclick="bulkAction('confirmed')" style="display:none">Confirm Selected</button>
+    </div>
+  </header>
+
+  <!-- ── Dashboard KPI strip ── -->
+  <div class="rv-kpi-strip" id="rvKpiStrip" style="display:none">
+    <div class="rv-kpi rv-kpi-total">
+      <div class="rv-kpi-val" id="kpiTotal">—</div>
+      <div class="rv-kpi-label">Hit Rows</div>
+    </div>
+    <div class="rv-kpi rv-kpi-critical" onclick="filterBand('critical')">
+      <div class="rv-kpi-val" id="kpiCritical">—</div>
+      <div class="rv-kpi-label">Critical</div>
+    </div>
+    <div class="rv-kpi rv-kpi-high" onclick="filterBand('high')">
+      <div class="rv-kpi-val" id="kpiHigh">—</div>
+      <div class="rv-kpi-label">High</div>
+    </div>
+    <div class="rv-kpi rv-kpi-medium" onclick="filterBand('medium')">
+      <div class="rv-kpi-val" id="kpiMedium">—</div>
+      <div class="rv-kpi-label">Medium</div>
+    </div>
+    <div class="rv-kpi rv-kpi-low" onclick="filterBand('low')">
+      <div class="rv-kpi-val" id="kpiLow">—</div>
+      <div class="rv-kpi-label">Low</div>
+    </div>
+    <div class="rv-kpi-divider"></div>
+    <div class="rv-kpi rv-kpi-reviewed">
+      <div class="rv-kpi-val" id="kpiReviewedPct">—</div>
+      <div class="rv-kpi-label">Reviewed</div>
+    </div>
+    <div class="rv-kpi rv-kpi-confirmed">
+      <div class="rv-kpi-val" id="kpiConfirmed">—</div>
+      <div class="rv-kpi-label">Confirmed</div>
+    </div>
+    <div class="rv-kpi rv-kpi-fp">
+      <div class="rv-kpi-val" id="kpiFp">—</div>
+      <div class="rv-kpi-label">False Positive</div>
+    </div>
+    <div class="rv-kpi rv-kpi-amount">
+      <div class="rv-kpi-val" id="kpiAmountAtRisk">—</div>
+      <div class="rv-kpi-label">Amount at Risk</div>
+    </div>
+  </div>
+
+  <!-- ── 3-panel body ── -->
+  <div class="rv-body">
+
+    <!-- Left: Filters -->
+    <aside class="rv-filters" id="rvFilters" style="display:none">
+      <div class="rv-filter-title">Filters</div>
+
+      <button class="rv-clear-btn" onclick="clearFilters()">Clear All</button>
+
+      <!-- Risk Band -->
+      <div class="rv-filter-group">
+        <div class="rv-filter-label">Risk Band</div>
+        <label class="rv-chip-label critical"><input type="checkbox" name="band" value="critical" onchange="applyFilters()"> Critical</label>
+        <label class="rv-chip-label high"><input type="checkbox" name="band" value="high" onchange="applyFilters()"> High</label>
+        <label class="rv-chip-label medium"><input type="checkbox" name="band" value="medium" onchange="applyFilters()"> Medium</label>
+        <label class="rv-chip-label low"><input type="checkbox" name="band" value="low" onchange="applyFilters()"> Low</label>
+      </div>
+
+      <!-- Review Status -->
+      <div class="rv-filter-group">
+        <div class="rv-filter-label">Status</div>
+        <label class="rv-chip-label"><input type="checkbox" name="status" value="pending" onchange="applyFilters()"> Pending</label>
+        <label class="rv-chip-label"><input type="checkbox" name="status" value="confirmed" onchange="applyFilters()"> Confirmed</label>
+        <label class="rv-chip-label"><input type="checkbox" name="status" value="false_positive" onchange="applyFilters()"> False Positive</label>
+        <label class="rv-chip-label"><input type="checkbox" name="status" value="needs_info" onchange="applyFilters()"> Needs Info</label>
+      </div>
+
+      <!-- Smart toggles -->
+      <div class="rv-filter-group">
+        <div class="rv-filter-label">Smart Filters</div>
+        <label class="rv-toggle-row">
+          <input type="checkbox" id="overlapOnly" onchange="applyFilters()">
+          <span>Multi-test overlap only</span>
+        </label>
+        <label class="rv-toggle-row">
+          <input type="checkbox" id="redFlagOnly" onchange="applyFilters()">
+          <span>Red flag tests only</span>
+        </label>
+      </div>
+
+      <!-- Tests -->
+      <div class="rv-filter-group">
+        <div class="rv-filter-label">Tests</div>
+        <div id="testCheckboxes" class="rv-test-checks"></div>
+      </div>
+
+      <!-- Vendor search -->
+      <div class="rv-filter-group">
+        <div class="rv-filter-label">Vendor</div>
+        <input type="text" id="vendorSearch" class="rv-input" placeholder="Search name or number…" oninput="debounceFilters()">
+      </div>
+
+      <!-- Amount range -->
+      <div class="rv-filter-group">
+        <div class="rv-filter-label">Amount Range</div>
+        <div style="display:flex;gap:6px">
+          <input type="number" id="minAmount" class="rv-input" placeholder="Min" oninput="debounceFilters()">
+          <input type="number" id="maxAmount" class="rv-input" placeholder="Max" oninput="debounceFilters()">
+        </div>
+      </div>
+    </aside>
+
+    <!-- Center: Hit list -->
+    <main class="rv-list-panel" id="rvListPanel" style="display:none">
+      <div class="rv-list-header">
+        <div class="rv-list-info">
+          <span id="rvListCount">—</span>
+          <span class="rv-list-hint">sorted by risk score</span>
+        </div>
+        <div class="rv-list-controls">
+          <label class="rv-toggle-row" style="font-size:12px">
+            <input type="checkbox" id="selectAllVisible" onchange="toggleSelectAll(this.checked)">
+            <span>Select page</span>
+          </label>
+        </div>
+      </div>
+
+      <div id="rvHitList" class="rv-hit-list"></div>
+
+      <div class="rv-pagination" id="rvPagination" style="display:none">
+        <button class="rv-page-btn" id="prevBtn" onclick="changePage(-1)">← Prev</button>
+        <span id="pageInfo" class="rv-page-info"></span>
+        <button class="rv-page-btn" id="nextBtn" onclick="changePage(1)">Next →</button>
+      </div>
+    </main>
+
+    <!-- Right: Detail panel -->
+    <aside class="rv-detail" id="rvDetail">
+      <div class="rv-detail-empty" id="rvDetailEmpty">
+        <div class="rv-detail-empty-icon">◎</div>
+        <div>Select an invoice row to review</div>
+        <div style="font-size:12px;opacity:.5;margin-top:4px">Click any row in the list</div>
+      </div>
+      <div id="rvDetailContent" style="display:none">
+        <!-- filled by JS -->
+      </div>
+    </aside>
+
+  </div><!-- /rv-body -->
+
+  <!-- Empty / loading states -->
+  <div class="rv-empty" id="rvEmpty" style="display:none">
+    <div class="rv-empty-icon">📋</div>
+    <div>No run selected</div>
+    <div style="font-size:13px;opacity:.6;margin-top:6px">Select a completed validation run above to begin reviewing</div>
+    <a href="/" class="rv-btn-primary" style="margin-top:16px;text-decoration:none">Go to Validation</a>
+  </div>
+
+  <div class="rv-loading" id="rvLoading" style="display:none">
+    <div class="rv-spinner"></div>
+    <div>Loading review data…</div>
+  </div>
+
+</div><!-- /rv-shell -->
+
+<script src="/static/review.js"></script>
+</body>
+</html>
