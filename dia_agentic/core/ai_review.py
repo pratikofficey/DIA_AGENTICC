@@ -8,7 +8,7 @@ import time
 
 from groq import Groq
 
-MODELS = ["qwen/qwen3.6-27b"]
+MODELS = ["openai/gpt-oss-20b"]
 MAX_RETRIES_ON_429 = 2
 RETRY_WAIT_SECONDS = 15
 MAX_CLUSTERS_SENT = 20  # keep payload tight to avoid empty responses

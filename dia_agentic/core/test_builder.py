@@ -87,7 +87,7 @@ def build_test(prompt: str, sample_rows: list[dict]) -> dict:
         for attempt in range(2):
             try:
                 resp = client.chat.completions.create(
-                    model="qwen/qwen3.6-27b",
+                    model="openai/gpt-oss-20b",
                     messages=[
                         {"role": "system", "content": system},
                         {"role": "user", "content": user_message},
