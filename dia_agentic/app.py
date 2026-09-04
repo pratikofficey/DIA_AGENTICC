@@ -31,26 +31,48 @@ from dia_agentic.core.auth import (
     logout as auth_logout, require_auth, create_user, list_users, change_password,
 )
 
-# Load .env
-from pathlib import Path as _P
-import os as _os
-_env = _P(__file__).parent.parent / ".env"
-if _env.exists():
-    for _line in _env.read_text().splitlines():
+# ---------------------------------------------------------------------------
+# Application paths / environment
+# ---------------------------------------------------------------------------
+# app.py is located at:
+#     <project-root>/dia_agentic/app.py
+#
+# Keeping the paths explicit makes the application work consistently when
+# started locally with Uvicorn and when imported by Vercel's Python runtime.
+BASE_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = BASE_DIR.parent
+
+# Local development convenience only.
+# In Vercel, environment variables should be configured in:
+# Vercel -> Project -> Settings -> Environment Variables
+ENV_FILE = PROJECT_ROOT / ".env"
+if ENV_FILE.exists():
+    for _line in ENV_FILE.read_text(encoding="utf-8").splitlines():
         _line = _line.strip()
         if _line and not _line.startswith("#") and "=" in _line:
             _k, _v = _line.split("=", 1)
-            _os.environ.setdefault(_k.strip(), _v.strip())
+            os.environ.setdefault(_k.strip(), _v.strip())
 
 app = FastAPI(title="DIA Agentic")
+
+# Initialize application storage/authentication when the module is imported.
+# NOTE: For Vercel production, the functions behind these calls should use
+# persistent external storage rather than relying on a local SQLite/file
+# system if data must survive across serverless invocations.
 init_db()
 init_auth_tables()
 seed_default_user()
 
 _SERVER_SESSION = str(uuid.uuid4())
 
-static_dir = Path(__file__).parent / "static"
+# Static assets are kept under <project-root>/dia_agentic/static.
+static_dir = BASE_DIR / "static"
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "service": "DIA Agentic"}
 
 
 def _row_evidence(flagged_by: list, row: dict) -> list:
@@ -601,3 +623,22 @@ def last_test_session(run_id: str, sess=Depends(require_auth)):
         "low": sum(1 for r in scored if r.band_css == "low"),
     }
     return sess
+
+
+# ---------------------------------------------------------------------------
+# Local development
+# ---------------------------------------------------------------------------
+# Run locally with:
+#     python -m uvicorn dia_agentic.app:app --host 127.0.0.1 --port 8005 --reload
+#
+# Vercel does NOT use this block. Vercel imports `app` from the configured
+# Python entrypoint (for example, api/index.py).
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(
+        "dia_agentic.app:app",
+        host="127.0.0.1",
+        port=8005,
+        reload=True,
+    )
