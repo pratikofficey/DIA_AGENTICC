@@ -27,10 +27,8 @@ from fastapi import Header, HTTPException
 # ============================================================
 
 # Vercel's deployed filesystem is read-only.
-#
 # /tmp is the writable temporary filesystem available to the
 # serverless function.
-#
 # Locally we continue using the original database location.
 
 if os.getenv("VERCEL"):
@@ -61,12 +59,6 @@ def _conn():
     Vercel:
         /tmp/agentic_runs.db
     """
-
-    # This directory is writable in both environments:
-    #
-    # Local  -> dia_agentic/data
-    # Vercel -> /tmp
-    #
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
     c = sqlite3.connect(
@@ -77,13 +69,8 @@ def _conn():
 
     c.row_factory = sqlite3.Row
 
-    # Wait up to 30 seconds if another request is using SQLite.
     c.execute("PRAGMA busy_timeout = 30000")
 
-    # WAL helps when multiple requests access SQLite.
-    #
-    # If the environment does not support it, don't let this
-    # prevent the application from starting.
     try:
         c.execute("PRAGMA journal_mode = WAL")
     except sqlite3.DatabaseError:
@@ -97,12 +84,7 @@ def _conn():
 # ============================================================
 
 def _hash(password: str) -> str:
-    """
-    Hash a password using SHA-256.
-
-    Kept compatible with the existing POC implementation.
-    """
-
+    """Hash a password using SHA-256."""
     return hashlib.sha256(password.encode()).hexdigest()
 
 
@@ -111,18 +93,8 @@ def _hash(password: str) -> str:
 # ============================================================
 
 def init_auth_tables():
-    """
-    Create authentication tables if they do not already exist.
-
-    Safe to call multiple times.
-    """
-
+    """Create authentication tables if they do not already exist."""
     with _conn() as c:
-
-        # ----------------------------------------------------
-        # USERS
-        # ----------------------------------------------------
-
         c.execute(
             """
             CREATE TABLE IF NOT EXISTS users (
@@ -134,10 +106,6 @@ def init_auth_tables():
             )
             """
         )
-
-        # ----------------------------------------------------
-        # SESSIONS
-        # ----------------------------------------------------
 
         c.execute(
             """
@@ -155,156 +123,102 @@ def init_auth_tables():
 
 
 # ============================================================
-# DEFAULT USER
+# DEFAULT USER  (UPDATED – always forces password from env)
 # ============================================================
 
 def seed_default_user():
     """
-    Create the default user if no user with the configured
-    username exists.
+    Always ensure the default user exists and has the password
+    that is currently set in the environment variables.
 
     Environment variables:
-
         DIA_DEFAULT_USER
         DIA_DEFAULT_PASSWORD
         DIA_DEFAULT_DISPLAY
 
-    Defaults:
-
+    Defaults (only if env vars are missing):
         admin
-        admin123
+        Adi@1029
         Admin
     """
+    username = os.environ.get("DIA_DEFAULT_USER", "admin").strip()
+    password = os.environ.get("DIA_DEFAULT_PASSWORD", "Adi@1029").strip()
+    display  = os.environ.get("DIA_DEFAULT_DISPLAY", "Admin").strip()
 
-    username = os.environ.get(
-        "DIA_DEFAULT_USER",
-        "admin",
-    ).strip()
-
-    password = os.environ.get(
-        "DIA_DEFAULT_PASSWORD",
-        "admin12345",
-    ).strip()
-
-    display = os.environ.get(
-        "DIA_DEFAULT_DISPLAY",
-        "Admin",
-    ).strip()
+    password_hash = _hash(password)
 
     with _conn() as c:
-
         exists = c.execute(
-            """
-            SELECT id
-            FROM users
-            WHERE username=?
-            """,
+            "SELECT id FROM users WHERE username=?",
             (username,),
         ).fetchone()
 
-        if not exists:
-
+        if exists:
+            # Force-update the password and display name
             c.execute(
                 """
-                INSERT INTO users
-                    (
-                        username,
-                        password_hash,
-                        display_name
-                    )
+                UPDATE users
+                SET password_hash = ?, display_name = ?
+                WHERE username = ?
+                """,
+                (password_hash, display, username),
+            )
+            # Invalidate all existing sessions for this user
+            c.execute(
+                "DELETE FROM sessions WHERE user_id = ?",
+                (exists["id"],),
+            )
+            print(f"[DIA Auth] Default user password updated: {username}")
+        else:
+            c.execute(
+                """
+                INSERT INTO users (username, password_hash, display_name)
                 VALUES (?, ?, ?)
                 """,
-                (
-                    username,
-                    _hash(password),
-                    display,
-                ),
+                (username, password_hash, display),
             )
+            print(f"[DIA Auth] Default user created: {username}")
 
-            c.commit()
-
-            print(
-                f"[DIA Auth] Default user created: {username}"
-            )
+        c.commit()
 
 
 # ============================================================
 # LOGIN
 # ============================================================
 
-def login(
-    username: str,
-    password: str,
-) -> dict | None:
-    """
-    Authenticate a user and create a session token.
-
-    Returns:
-        Authentication dictionary on success.
-        None on invalid credentials.
-    """
-
+def login(username: str, password: str) -> dict | None:
+    """Authenticate a user and create a session token."""
     with _conn() as c:
-
         user = c.execute(
             """
-            SELECT
-                id,
-                username,
-                display_name
+            SELECT id, username, display_name
             FROM users
-            WHERE username=?
-              AND password_hash=?
+            WHERE username=? AND password_hash=?
             """,
-            (
-                username.strip(),
-                _hash(password),
-            ),
+            (username.strip(), _hash(password)),
         ).fetchone()
 
         if not user:
             return None
 
-        # Generate secure random session token.
         token = secrets.token_hex(32)
-
         now = datetime.now(timezone.utc)
-
-        exp = now + timedelta(
-            hours=TOKEN_TTL_HOURS
-        )
+        exp = now + timedelta(hours=TOKEN_TTL_HOURS)
 
         c.execute(
             """
-            INSERT INTO sessions
-                (
-                    token,
-                    user_id,
-                    username,
-                    created_at,
-                    expires_at
-                )
+            INSERT INTO sessions (token, user_id, username, created_at, expires_at)
             VALUES (?, ?, ?, ?, ?)
             """,
-            (
-                token,
-                user["id"],
-                user["username"],
-                now.isoformat(),
-                exp.isoformat(),
-            ),
+            (token, user["id"], user["username"], now.isoformat(), exp.isoformat()),
         )
-
         c.commit()
 
         return {
             "token": token,
             "user_id": user["id"],
             "username": user["username"],
-            "display_name": (
-                user["display_name"]
-                or user["username"]
-            ),
+            "display_name": user["display_name"] or user["username"],
             "expires_at": exp.isoformat(),
         }
 
@@ -314,23 +228,11 @@ def login(
 # ============================================================
 
 def logout(token: str):
-    """
-    Delete a session token.
-    """
-
+    """Delete a session token."""
     if not token:
         return
-
     with _conn() as c:
-
-        c.execute(
-            """
-            DELETE FROM sessions
-            WHERE token=?
-            """,
-            (token,),
-        )
-
+        c.execute("DELETE FROM sessions WHERE token=?", (token,))
         c.commit()
 
 
@@ -338,34 +240,17 @@ def logout(token: str):
 # GET SESSION
 # ============================================================
 
-def get_session(
-    token: str,
-) -> dict | None:
-    """
-    Validate a session token.
-
-    Returns:
-        {
-            "user_id": ...,
-            "username": ...
-        }
-
-    or None if the session is invalid/expired.
-    """
-
+def get_session(token: str) -> dict | None:
+    """Validate a session token."""
     if not token:
         return None
 
     with _conn() as c:
-
         row = c.execute(
             """
-            SELECT
-                user_id,
-                username
+            SELECT user_id, username
             FROM sessions
-            WHERE token=?
-              AND expires_at > datetime('now')
+            WHERE token=? AND expires_at > datetime('now')
             """,
             (token,),
         ).fetchone()
@@ -383,34 +268,14 @@ def get_session(
 # FASTAPI AUTH DEPENDENCY
 # ============================================================
 
-def require_auth(
-    x_auth_token: str = Header(default=""),
-):
-    """
-    FastAPI dependency.
-
-    Add this dependency to routes that require authentication.
-
-    Example:
-
-        @app.get("/protected")
-        def protected(user=Depends(require_auth)):
-            ...
-    """
-
+def require_auth(x_auth_token: str = Header(default="")):
+    """FastAPI dependency that requires a valid session."""
     if not x_auth_token:
-        raise HTTPException(
-            status_code=401,
-            detail="Not authenticated",
-        )
+        raise HTTPException(status_code=401, detail="Not authenticated")
 
     sess = get_session(x_auth_token)
-
     if not sess:
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid or expired session",
-        )
+        raise HTTPException(status_code=401, detail="Invalid or expired session")
 
     return sess
 
@@ -419,52 +284,22 @@ def require_auth(
 # CREATE USER
 # ============================================================
 
-def create_user(
-    username: str,
-    password: str,
-    display_name: str = "",
-) -> bool:
-    """
-    Create a new user.
-
-    Returns:
-        True  -> user created
-        False -> username already exists
-    """
-
+def create_user(username: str, password: str, display_name: str = "") -> bool:
+    """Create a new user. Returns True on success, False if username exists."""
     username = username.strip()
-
-    display_name = (
-        display_name.strip()
-        if display_name
-        else username
-    )
+    display_name = display_name.strip() if display_name else username
 
     try:
-
         with _conn() as c:
-
             c.execute(
                 """
-                INSERT INTO users
-                    (
-                        username,
-                        password_hash,
-                        display_name
-                    )
+                INSERT INTO users (username, password_hash, display_name)
                 VALUES (?, ?, ?)
                 """,
-                (
-                    username,
-                    _hash(password),
-                    display_name,
-                ),
+                (username, _hash(password), display_name),
             )
-
             c.commit()
-
         return True
-
     except sqlite3.IntegrityError:
         return False
 
@@ -474,68 +309,30 @@ def create_user(
 # ============================================================
 
 def list_users() -> list[dict]:
-    """
-    Return all registered users.
-    """
-
+    """Return all registered users."""
     with _conn() as c:
-
         rows = c.execute(
             """
-            SELECT
-                id,
-                username,
-                display_name,
-                created_at
+            SELECT id, username, display_name, created_at
             FROM users
             ORDER BY id
             """
         ).fetchall()
-
-    return [
-        dict(row)
-        for row in rows
-    ]
+    return [dict(row) for row in rows]
 
 
 # ============================================================
 # CHANGE PASSWORD
 # ============================================================
 
-def change_password(
-    user_id: int,
-    new_password: str,
-):
-    """
-    Change a user's password.
-
-    All existing sessions for that user are invalidated.
-    """
-
+def change_password(user_id: int, new_password: str):
+    """Change a user's password and invalidate all their sessions."""
     with _conn() as c:
-
         c.execute(
-            """
-            UPDATE users
-            SET password_hash=?
-            WHERE id=?
-            """,
-            (
-                _hash(new_password),
-                user_id,
-            ),
+            "UPDATE users SET password_hash=? WHERE id=?",
+            (_hash(new_password), user_id),
         )
-
-        # Force the user to log in again after changing
-        # their password.
-        c.execute(
-            """
-            DELETE FROM sessions
-            WHERE user_id=?
-            """,
-            (user_id,),
-        )
-
+        c.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
         c.commit()
 
 
@@ -544,26 +341,13 @@ def change_password(
 # ============================================================
 
 def get_db_path() -> str:
-    """
-    Return the active database path.
-
-    Useful for debugging.
-    """
-
     return str(DB_PATH)
 
 
 def auth_database_health_check() -> bool:
-    """
-    Verify that the authentication database can be opened.
-    """
-
     try:
-
         with _conn() as c:
             c.execute("SELECT 1").fetchone()
-
         return True
-
     except Exception:
         return False
