@@ -183,7 +183,7 @@ def seed_default_user():
 
     password = os.environ.get(
         "DIA_DEFAULT_PASSWORD",
-        "admin123",
+        "admin12345",
     ).strip()
 
     display = os.environ.get(
