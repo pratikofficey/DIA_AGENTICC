@@ -1,96 +1,67 @@
-"""
-Mapping registry with pluggable storage backends.
-
-Production path:
-    PostgreSQL + pgvector
-    (set DATABASE_URL and/or MAPPING_DB_BACKEND=pgvector)
-
-Fallback path:
-    SQLite local registry.
-
-Vercel:
-    SQLite uses /tmp because the deployed filesystem is read-only.
-
-Local development:
-    SQLite uses dia_agentic/data/mapping_registry.db
-"""
-
+import hashlib
 import json
 import math
 import os
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Protocol
 
 try:
     import psycopg
-except Exception:  # pragma: no cover
+except Exception:
     psycopg = None
 
-
-# ============================================================
-# CONFIGURATION
-# ============================================================
 
 VECTOR_DIM = 256
 
 
-def _get_sqlite_db_path() -> Path:
-    """
-    Return the correct SQLite database location.
-
-    Local development:
-        dia_agentic/data/mapping_registry.db
-
-    Vercel:
-        /tmp/mapping_registry.db
-
-    Vercel's /var/task filesystem is read-only, while /tmp
-    is writable for the lifetime of the serverless instance.
-    """
-
-    if os.environ.get("VERCEL"):
-        return Path("/tmp/mapping_registry.db")
-
-    return (
-        Path(__file__).resolve().parent.parent
-        / "data"
-        / "mapping_registry.db"
-    )
+def _normalize(value: str) -> str:
+    return (value or "").strip().lower()
 
 
-DB_PATH = _get_sqlite_db_path()
-
-
-# ============================================================
-# TEXT / VECTOR HELPERS
-# ============================================================
-
-def _normalize(name: str) -> str:
-    return name.strip().lower()
+def _normalize_erp(value: str | None) -> str:
+    return (value or "").strip().upper()
 
 
 def _tokenize(text: str) -> list[str]:
-    t = (
+    text = (
         _normalize(text)
         .replace("_", " ")
         .replace("-", " ")
         .replace("/", " ")
     )
 
-    words = [w for w in t.split() if w]
+    words = [word for word in text.split() if word]
 
     ngrams = []
 
-    for w in words:
-        for n in (2, 3):
-            ngrams += [
-                w[i:i + n]
-                for i in range(len(w) - n + 1)
-            ]
+    for word in words:
+        for size in (2, 3):
+            if len(word) >= size:
+                ngrams.extend(
+                    word[i:i + size]
+                    for i in range(len(word) - size + 1)
+                )
 
     return words + ngrams
+
+
+def _stable_bucket(
+    token: str,
+    dim: int,
+) -> int:
+
+    digest = hashlib.blake2b(
+        token.encode("utf-8"),
+        digest_size=8,
+        person=b"DIA-MAP",
+    ).digest()
+
+    return int.from_bytes(
+        digest,
+        "big",
+    ) % dim
 
 
 def _embed_dense(
@@ -100,22 +71,29 @@ def _embed_dense(
 
     tokens = _tokenize(text)
 
-    vec = [0.0] * dim
+    vector = [0.0] * dim
 
     if not tokens:
-        return vec
+        return vector
 
-    for tok in tokens:
-        idx = hash(tok) % dim
-        vec[idx] += 1.0
+    for token in tokens:
+        vector[
+            _stable_bucket(
+                token,
+                dim,
+            )
+        ] += 1.0
 
-    norm = math.sqrt(
-        sum(v * v for v in vec)
+    magnitude = math.sqrt(
+        sum(
+            value * value
+            for value in vector
+        )
     ) or 1.0
 
     return [
-        v / norm
-        for v in vec
+        value / magnitude
+        for value in vector
     ]
 
 
@@ -127,37 +105,160 @@ def _cosine_dense(
     if not a or not b:
         return 0.0
 
+    size = min(
+        len(a),
+        len(b),
+    )
+
+    if not size:
+        return 0.0
+
+    left = a[:size]
+    right = b[:size]
+
     dot = sum(
         x * y
-        for x, y in zip(a, b)
+        for x, y in zip(
+            left,
+            right,
+        )
     )
 
     mag_a = math.sqrt(
-        sum(x * x for x in a)
+        sum(
+            x * x
+            for x in left
+        )
     ) or 1.0
 
     mag_b = math.sqrt(
-        sum(y * y for y in b)
+        sum(
+            y * y
+            for y in right
+        )
     ) or 1.0
 
-    return dot / (mag_a * mag_b)
+    return dot / (
+        mag_a * mag_b
+    )
 
 
 def _to_pgvector_literal(
-    vec: list[float],
+    vector: list[float],
 ) -> str:
 
-    return "[" + ",".join(
-        f"{x:.8f}"
-        for x in vec
-    ) + "]"
+    return (
+        "["
+        + ",".join(
+            f"{value:.8f}"
+            for value in vector
+        )
+        + "]"
+    )
 
 
-# ============================================================
-# PROTOCOL
-# ============================================================
+def _sqlite_db_path() -> Path:
 
-class RegistryProtocol(Protocol):
+    configured = (
+        os.environ.get(
+            "MAPPING_SQLITE_PATH"
+        )
+        or ""
+    ).strip()
+
+    if configured:
+        return Path(
+            configured
+        ).expanduser()
+
+    if os.environ.get("VERCEL"):
+        return Path(
+            "/tmp/mapping_registry.db"
+        )
+
+    return (
+        Path(__file__)
+        .resolve()
+        .parent
+        .parent
+        / "data"
+        / "mapping_registry.db"
+    )
+
+
+DB_PATH = _sqlite_db_path()
+
+
+def _normalize_alternatives(
+    alternatives: list | None,
+    udm_field: str,
+    confidence: float,
+    method: str,
+) -> list[dict]:
+
+    result = []
+
+    seen = set()
+
+    primary = {
+        "udm_field": udm_field,
+        "confidence": confidence,
+        "reason": method or "",
+    }
+
+    seen.add(
+        str(udm_field)
+    )
+
+    result.append(
+        primary
+    )
+
+    for item in alternatives or []:
+
+        if not isinstance(
+            item,
+            dict,
+        ):
+            continue
+
+        field = str(
+            item.get(
+                "udm_field"
+            )
+            or ""
+        ).strip()
+
+        if not field:
+            continue
+
+        if field in seen:
+            continue
+
+        seen.add(
+            field
+        )
+
+        result.append(
+            {
+                "udm_field": field,
+                "confidence": item.get(
+                    "confidence",
+                    0.0,
+                ),
+                "reason": item.get(
+                    "reason",
+                    "",
+                ),
+            }
+        )
+
+    return result
+
+
+class RegistryProtocol(
+    Protocol
+):
 
     backend: str
 
@@ -199,6 +300,7 @@ class RegistryProtocol(Protocol):
         erp_type: str | None = None,
         module: str = "invoices",
         approved_by: str | None = None,
+        alternatives: list | None = None,
     ) -> int:
         ...
 
@@ -222,10 +324,11 @@ class RegistryProtocol(Protocol):
     ) -> dict:
         ...
 
+    def close(
+        self,
+    ) -> None:
+        ...
 
-# ============================================================
-# SQLITE REGISTRY
-# ============================================================
 
 class SQLiteMappingRegistry:
 
@@ -233,7 +336,7 @@ class SQLiteMappingRegistry:
 
     def __init__(
         self,
-        db_path: Path | None = None,
+        db_path: Path | str | None = None,
     ):
 
         self.db_path = (
@@ -242,97 +345,146 @@ class SQLiteMappingRegistry:
             else DB_PATH
         )
 
-        # IMPORTANT:
-        #
-        # On Vercel this will be:
-        #     /tmp
-        #
-        # and therefore writable.
         self.db_path.parent.mkdir(
             parents=True,
             exist_ok=True,
         )
 
         self.conn = sqlite3.connect(
-            str(self.db_path),
-            check_same_thread=False,
+            str(
+                self.db_path
+            ),
             timeout=30,
+            check_same_thread=False,
         )
 
-        # Return rows as sqlite3.Row objects.
-        self.conn.row_factory = sqlite3.Row
+        self.conn.row_factory = (
+            sqlite3.Row
+        )
 
-        # Helps when multiple requests access SQLite.
-        try:
-            self.conn.execute(
-                "PRAGMA busy_timeout = 30000"
-            )
-        except Exception:
-            pass
+        self.conn.execute(
+            "PRAGMA busy_timeout = 30000"
+        )
 
-        # WAL is useful for concurrent reads/writes.
         try:
             self.conn.execute(
                 "PRAGMA journal_mode = WAL"
             )
-        except Exception:
+        except sqlite3.DatabaseError:
+            pass
+
+        try:
+            self.conn.execute(
+                "PRAGMA synchronous = NORMAL"
+            )
+        except sqlite3.DatabaseError:
             pass
 
         self._init_db()
 
-    # --------------------------------------------------------
-    # DATABASE INITIALIZATION
-    # --------------------------------------------------------
-
-    def _init_db(self):
+    def _init_db(
+        self,
+    ) -> None:
 
         self.conn.execute(
             """
             CREATE TABLE IF NOT EXISTS column_mappings (
-                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
                 source_column TEXT NOT NULL,
-                source_norm   TEXT NOT NULL,
-                erp_type      TEXT,
-                module        TEXT DEFAULT 'invoices',
-                udm_field     TEXT NOT NULL,
-                status        TEXT NOT NULL DEFAULT 'inferred',
-                confidence    REAL DEFAULT 0.0,
-                method        TEXT,
-                vector        TEXT,
-                alternatives  TEXT DEFAULT '[]',
-                approved_by   TEXT,
-                approved_at   TEXT,
-                created_at    TEXT DEFAULT (datetime('now')),
-                UNIQUE(source_norm, erp_type, module)
+                source_norm TEXT NOT NULL,
+                erp_type TEXT NOT NULL DEFAULT '',
+                module TEXT NOT NULL DEFAULT 'invoices',
+                udm_field TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'inferred',
+                confidence REAL NOT NULL DEFAULT 0.0,
+                method TEXT NOT NULL DEFAULT '',
+                vector TEXT,
+                alternatives TEXT NOT NULL DEFAULT '[]',
+                approved_by TEXT,
+                approved_at TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(
+                    source_norm,
+                    erp_type,
+                    module
+                )
             )
             """
         )
 
-        # ----------------------------------------------------
-        # Backward compatibility:
-        # Add alternatives to databases created by an older
-        # version of the application.
-        # ----------------------------------------------------
+        columns = {
+            row["name"]
+            for row
+            in self.conn.execute(
+                """
+                PRAGMA table_info(
+                    column_mappings
+                )
+                """
+            ).fetchall()
+        }
 
-        try:
-
-            self.conn.execute(
+        migrations = {
+            "alternatives":
                 """
                 ALTER TABLE column_mappings
-                ADD COLUMN alternatives TEXT DEFAULT '[]'
+                ADD COLUMN alternatives
+                TEXT NOT NULL
+                DEFAULT '[]'
+                """,
+
+            "approved_by":
                 """
+                ALTER TABLE column_mappings
+                ADD COLUMN approved_by TEXT
+                """,
+
+            "approved_at":
+                """
+                ALTER TABLE column_mappings
+                ADD COLUMN approved_at TEXT
+                """,
+
+            "vector":
+                """
+                ALTER TABLE column_mappings
+                ADD COLUMN vector TEXT
+                """,
+        }
+
+        for (
+            column,
+            statement,
+        ) in migrations.items():
+
+            if column not in columns:
+                self.conn.execute(
+                    statement
+                )
+
+        self.conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+            idx_cm_status_module
+            ON column_mappings(
+                status,
+                module
             )
+            """
+        )
 
-            self.conn.commit()
-
-        except Exception:
-            pass
+        self.conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+            idx_cm_norm_module
+            ON column_mappings(
+                source_norm,
+                module
+            )
+            """
+        )
 
         self.conn.commit()
-
-    # --------------------------------------------------------
-    # EXACT LOOKUP
-    # --------------------------------------------------------
 
     def exact_lookup(
         self,
@@ -341,12 +493,12 @@ class SQLiteMappingRegistry:
         module: str = "invoices",
     ) -> dict | None:
 
-        norm = _normalize(source_column)
+        norm = _normalize(
+            source_column
+        )
 
-        erp = (
-            (erp_type or "")
-            .strip()
-            .upper()
+        erp = _normalize_erp(
+            erp_type
         )
 
         row = self.conn.execute(
@@ -361,18 +513,25 @@ class SQLiteMappingRegistry:
             WHERE source_norm = ?
               AND (
                     erp_type = ?
-                    OR erp_type IS NULL
                     OR erp_type = ''
+                    OR erp_type IS NULL
                   )
               AND module = ?
               AND status = 'confirmed'
-            ORDER BY confidence DESC
+            ORDER BY
+                CASE
+                    WHEN erp_type = ?
+                    THEN 0
+                    ELSE 1
+                END,
+                confidence DESC
             LIMIT 1
             """,
             (
                 norm,
                 erp,
                 module,
+                erp,
             ),
         ).fetchone()
 
@@ -380,16 +539,35 @@ class SQLiteMappingRegistry:
             return None
 
         return {
-            "source": row["source_column"],
-            "udm_field": row["udm_field"],
-            "status": row["status"],
-            "confidence": row["confidence"],
-            "method": row["method"],
-        }
+            "source":
+                row[
+                    "source_column"
+                ],
 
-    # --------------------------------------------------------
-    # VECTOR SEARCH
-    # --------------------------------------------------------
+            "udm_field":
+                row[
+                    "udm_field"
+                ],
+
+            "status":
+                row[
+                    "status"
+                ],
+
+            "confidence":
+                float(
+                    row[
+                        "confidence"
+                    ]
+                    or 0.0
+                ),
+
+            "method":
+                row[
+                    "method"
+                ]
+                or "",
+        }
 
     def vector_search(
         self,
@@ -398,7 +576,9 @@ class SQLiteMappingRegistry:
         threshold: float = 0.55,
     ) -> dict | None:
 
-        query = _embed_dense(source_column)
+        query = _embed_dense(
+            source_column
+        )
 
         rows = self.conn.execute(
             """
@@ -411,52 +591,72 @@ class SQLiteMappingRegistry:
               AND module = ?
               AND vector IS NOT NULL
             """,
-            (module,),
+            (
+                module,
+            ),
         ).fetchall()
 
         best = None
+
         best_score = 0.0
 
         for row in rows:
 
             try:
+                stored = json.loads(
+                    row[
+                        "vector"
+                    ]
+                )
 
                 score = _cosine_dense(
                     query,
-                    json.loads(
-                        row["vector"]
-                    ),
+                    stored,
                 )
-
-                if score > best_score:
-
-                    best_score = score
-
-                    best = {
-                        "source": row["source_column"],
-                        "udm_field": row["udm_field"],
-                        "status": "confirmed",
-                        "confidence": round(
-                            score,
-                            3,
-                        ),
-                        "method": (
-                            f"vector({score:.0%})"
-                        ),
-                    }
 
             except Exception:
                 continue
 
-        return (
-            best
-            if best_score >= threshold
-            else None
-        )
+            if score > best_score:
 
-    # --------------------------------------------------------
-    # PENDING MAPPINGS
-    # --------------------------------------------------------
+                best_score = score
+
+                best = {
+                    "source":
+                        row[
+                            "source_column"
+                        ],
+
+                    "udm_field":
+                        row[
+                            "udm_field"
+                        ],
+
+                    "status":
+                        "confirmed",
+
+                    "confidence":
+                        round(
+                            score,
+                            3,
+                        ),
+
+                    "method":
+                        f"vector({score:.0%})",
+                }
+
+        if best is None:
+            return None
+
+        if (
+            best_score
+            < float(
+                threshold
+            )
+        ):
+            return None
+
+        return best
 
     def list_pending(
         self,
@@ -477,67 +677,97 @@ class SQLiteMappingRegistry:
             FROM column_mappings
             WHERE status = 'inferred'
               AND module = ?
-            ORDER BY created_at DESC
+            ORDER BY
+                created_at DESC,
+                id DESC
             """,
-            (module,),
+            (
+                module,
+            ),
         ).fetchall()
 
         result = []
 
-        for r in rows:
+        for row in rows:
 
             try:
-
-                alts = json.loads(
-                    r["alternatives"] or "[]"
+                alternatives = json.loads(
+                    row[
+                        "alternatives"
+                    ]
+                    or "[]"
                 )
 
             except Exception:
+                alternatives = []
 
-                alts = []
-
-            # Ensure primary suggestion is always first.
-            primary = {
-                "udm_field": r["udm_field"],
-                "confidence": r["confidence"],
-                "reason": r["method"] or "",
-            }
-
-            if (
-                not alts
-                or alts[0].get("udm_field")
-                != r["udm_field"]
-            ):
-
-                alts = [
-                    primary
-                ] + [
-                    a
-                    for a in alts
-                    if a.get("udm_field")
-                    != r["udm_field"]
-                ]
+            alternatives = (
+                _normalize_alternatives(
+                    alternatives,
+                    row[
+                        "udm_field"
+                    ],
+                    float(
+                        row[
+                            "confidence"
+                        ]
+                        or 0.0
+                    ),
+                    row[
+                        "method"
+                    ]
+                    or "",
+                )
+            )
 
             result.append(
                 {
-                    "id": r["id"],
-                    "source_column": r[
-                        "source_column"
-                    ],
-                    "erp_type": r["erp_type"],
-                    "udm_field": r["udm_field"],
-                    "confidence": r["confidence"],
-                    "method": r["method"],
-                    "created_at": r["created_at"],
-                    "alternatives": alts,
+                    "id":
+                        row[
+                            "id"
+                        ],
+
+                    "source_column":
+                        row[
+                            "source_column"
+                        ],
+
+                    "erp_type":
+                        row[
+                            "erp_type"
+                        ]
+                        or "",
+
+                    "udm_field":
+                        row[
+                            "udm_field"
+                        ],
+
+                    "confidence":
+                        float(
+                            row[
+                                "confidence"
+                            ]
+                            or 0.0
+                        ),
+
+                    "method":
+                        row[
+                            "method"
+                        ]
+                        or "",
+
+                    "created_at":
+                        row[
+                            "created_at"
+                        ],
+
+                    "alternatives":
+                        alternatives,
                 }
             )
 
         return result
-
-    # --------------------------------------------------------
-    # ALL MAPPINGS
-    # --------------------------------------------------------
 
     def list_all(
         self,
@@ -562,33 +792,72 @@ class SQLiteMappingRegistry:
                 CASE status
                     WHEN 'confirmed' THEN 0
                     WHEN 'inferred' THEN 1
-                    ELSE 2
+                    WHEN 'rejected' THEN 2
+                    ELSE 3
                 END,
-                created_at DESC
+                created_at DESC,
+                id DESC
             """,
-            (module,),
+            (
+                module,
+            ),
         ).fetchall()
 
         return [
             {
-                "id": r["id"],
-                "source_column": r[
-                    "source_column"
-                ],
-                "erp_type": r["erp_type"],
-                "udm_field": r["udm_field"],
-                "status": r["status"],
-                "confidence": r["confidence"],
-                "method": r["method"],
-                "approved_by": r["approved_by"],
-                "created_at": r["created_at"],
-            }
-            for r in rows
-        ]
+                "id":
+                    row[
+                        "id"
+                    ],
 
-    # --------------------------------------------------------
-    # UPSERT
-    # --------------------------------------------------------
+                "source_column":
+                    row[
+                        "source_column"
+                    ],
+
+                "erp_type":
+                    row[
+                        "erp_type"
+                    ]
+                    or "",
+
+                "udm_field":
+                    row[
+                        "udm_field"
+                    ],
+
+                "status":
+                    row[
+                        "status"
+                    ],
+
+                "confidence":
+                    float(
+                        row[
+                            "confidence"
+                        ]
+                        or 0.0
+                    ),
+
+                "method":
+                    row[
+                        "method"
+                    ]
+                    or "",
+
+                "approved_by":
+                    row[
+                        "approved_by"
+                    ],
+
+                "created_at":
+                    row[
+                        "created_at"
+                    ],
+            }
+
+            for row in rows
+        ]
 
     def upsert(
         self,
@@ -603,32 +872,90 @@ class SQLiteMappingRegistry:
         alternatives: list | None = None,
     ) -> int:
 
-        norm = _normalize(source_column)
+        source_column = (
+            source_column
+            or ""
+        ).strip()
 
-        erp = (
-            (erp_type or "")
-            .strip()
-            .upper()
+        udm_field = (
+            udm_field
+            or ""
+        ).strip()
+
+        status = (
+            status
+            or "inferred"
+        ).strip().lower()
+
+        method = (
+            method
+            or ""
+        ).strip()
+
+        module = (
+            module
+            or "invoices"
+        ).strip()
+
+        if not source_column:
+            raise ValueError(
+                "source_column is required"
+            )
+
+        if not udm_field:
+            raise ValueError(
+                "udm_field is required"
+            )
+
+        norm = _normalize(
+            source_column
+        )
+
+        erp = _normalize_erp(
+            erp_type
+        )
+
+        confidence_value = float(
+            confidence
+            or 0.0
         )
 
         vector_json = json.dumps(
-            _embed_dense(source_column)
+            _embed_dense(
+                source_column
+            ),
+            separators=(
+                ",",
+                ":",
+            ),
         )
 
         alternatives_json = json.dumps(
-            alternatives or []
+            _normalize_alternatives(
+                alternatives,
+                udm_field,
+                confidence_value,
+                method,
+            ),
+            separators=(
+                ",",
+                ":",
+            ),
         )
 
         approved_at = (
-            datetime.utcnow().isoformat()
+            datetime
+            .now(
+                timezone.utc
+            )
+            .isoformat()
             if approved_by
             else None
         )
 
         self.conn.execute(
             """
-            INSERT INTO column_mappings
-            (
+            INSERT INTO column_mappings (
                 source_column,
                 source_norm,
                 erp_type,
@@ -642,22 +969,44 @@ class SQLiteMappingRegistry:
                 approved_by,
                 approved_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-
+            VALUES (
+                ?,
+                ?,
+                ?,
+                ?,
+                ?,
+                ?,
+                ?,
+                ?,
+                ?,
+                ?,
+                ?,
+                ?
+            )
             ON CONFLICT(
                 source_norm,
                 erp_type,
                 module
             )
             DO UPDATE SET
-                udm_field = excluded.udm_field,
-                status = excluded.status,
-                confidence = excluded.confidence,
-                method = excluded.method,
-                vector = excluded.vector,
-                alternatives = excluded.alternatives,
-                approved_by = excluded.approved_by,
-                approved_at = excluded.approved_at
+                source_column =
+                    excluded.source_column,
+                udm_field =
+                    excluded.udm_field,
+                status =
+                    excluded.status,
+                confidence =
+                    excluded.confidence,
+                method =
+                    excluded.method,
+                vector =
+                    excluded.vector,
+                alternatives =
+                    excluded.alternatives,
+                approved_by =
+                    excluded.approved_by,
+                approved_at =
+                    excluded.approved_at
             """,
             (
                 source_column,
@@ -666,7 +1015,7 @@ class SQLiteMappingRegistry:
                 module,
                 udm_field,
                 status,
-                confidence,
+                confidence_value,
                 method,
                 vector_json,
                 alternatives_json,
@@ -692,15 +1041,14 @@ class SQLiteMappingRegistry:
             ),
         ).fetchone()
 
-        return (
-            row["id"]
-            if row
-            else -1
-        )
+        if not row:
+            return -1
 
-    # --------------------------------------------------------
-    # APPROVE
-    # --------------------------------------------------------
+        return int(
+            row[
+                "id"
+            ]
+        )
 
     def approve(
         self,
@@ -708,28 +1056,34 @@ class SQLiteMappingRegistry:
         approved_by: str = "system",
     ) -> bool:
 
-        cur = self.conn.execute(
+        cursor = self.conn.execute(
             """
             UPDATE column_mappings
             SET
                 status = 'confirmed',
                 approved_by = ?,
-                approved_at = datetime('now')
+                approved_at = ?
             WHERE id = ?
             """,
             (
                 approved_by,
-                mapping_id,
+                datetime
+                .now(
+                    timezone.utc
+                )
+                .isoformat(),
+                int(
+                    mapping_id
+                ),
             ),
         )
 
         self.conn.commit()
 
-        return cur.rowcount > 0
-
-    # --------------------------------------------------------
-    # REJECT
-    # --------------------------------------------------------
+        return (
+            cursor.rowcount
+            > 0
+        )
 
     def reject(
         self,
@@ -737,28 +1091,34 @@ class SQLiteMappingRegistry:
         approved_by: str = "system",
     ) -> bool:
 
-        cur = self.conn.execute(
+        cursor = self.conn.execute(
             """
             UPDATE column_mappings
             SET
                 status = 'rejected',
                 approved_by = ?,
-                approved_at = datetime('now')
+                approved_at = ?
             WHERE id = ?
             """,
             (
                 approved_by,
-                mapping_id,
+                datetime
+                .now(
+                    timezone.utc
+                )
+                .isoformat(),
+                int(
+                    mapping_id
+                ),
             ),
         )
 
         self.conn.commit()
 
-        return cur.rowcount > 0
-
-    # --------------------------------------------------------
-    # STATS
-    # --------------------------------------------------------
+        return (
+            cursor.rowcount
+            > 0
+        )
 
     def stats(
         self,
@@ -769,34 +1129,38 @@ class SQLiteMappingRegistry:
             """
             SELECT
                 status,
-                COUNT(*)
+                COUNT(*) AS count
             FROM column_mappings
             WHERE module = ?
             GROUP BY status
             """,
-            (module,),
+            (
+                module,
+            ),
         ).fetchall()
 
         return {
-            r[0]: r[1]
-            for r in rows
+            row[
+                "status"
+            ]:
+                int(
+                    row[
+                        "count"
+                    ]
+                )
+
+            for row in rows
         }
 
-    # --------------------------------------------------------
-    # CLOSE
-    # --------------------------------------------------------
-
-    def close(self):
+    def close(
+        self,
+    ) -> None:
 
         try:
             self.conn.close()
         except Exception:
             pass
 
-
-# ============================================================
-# POSTGRESQL + PGVECTOR REGISTRY
-# ============================================================
 
 class PgVectorMappingRegistry:
 
@@ -809,46 +1173,56 @@ class PgVectorMappingRegistry:
 
         if psycopg is None:
             raise RuntimeError(
-                "psycopg is not installed"
+                "psycopg is required for the pgvector mapping backend"
             )
+
+        self.database_url = (
+            database_url
+        )
 
         self.conn = psycopg.connect(
             database_url,
             autocommit=True,
+            connect_timeout=int(
+                os.environ.get(
+                    "MAPPING_DB_CONNECT_TIMEOUT",
+                    "5",
+                )
+            ),
         )
 
         self._init_db()
 
-    # --------------------------------------------------------
-    # DATABASE INITIALIZATION
-    # --------------------------------------------------------
+    def _init_db(
+        self,
+    ) -> None:
 
-    def _init_db(self):
+        with self.conn.cursor() as cursor:
 
-        with self.conn.cursor() as cur:
-
-            cur.execute(
+            cursor.execute(
                 """
-                CREATE EXTENSION IF NOT EXISTS vector
+                CREATE EXTENSION
+                IF NOT EXISTS vector
                 """
             )
 
-            cur.execute(
+            cursor.execute(
                 f"""
                 CREATE TABLE IF NOT EXISTS column_mappings (
                     id BIGSERIAL PRIMARY KEY,
                     source_column TEXT NOT NULL,
                     source_norm TEXT NOT NULL,
-                    erp_type TEXT,
-                    module TEXT DEFAULT 'invoices',
+                    erp_type TEXT NOT NULL DEFAULT '',
+                    module TEXT NOT NULL DEFAULT 'invoices',
                     udm_field TEXT NOT NULL,
                     status TEXT NOT NULL DEFAULT 'inferred',
-                    confidence DOUBLE PRECISION DEFAULT 0.0,
-                    method TEXT,
+                    confidence DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+                    method TEXT NOT NULL DEFAULT '',
                     vector VECTOR({VECTOR_DIM}),
+                    alternatives JSONB NOT NULL DEFAULT '[]'::jsonb,
                     approved_by TEXT,
                     approved_at TIMESTAMPTZ,
-                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     UNIQUE(
                         source_norm,
                         erp_type,
@@ -858,36 +1232,37 @@ class PgVectorMappingRegistry:
                 """
             )
 
-            cur.execute(
+            cursor.execute(
+                """
+                ALTER TABLE column_mappings
+                ADD COLUMN IF NOT EXISTS
+                alternatives JSONB
+                NOT NULL
+                DEFAULT '[]'::jsonb
+                """
+            )
+
+            cursor.execute(
                 """
                 CREATE INDEX IF NOT EXISTS
                 idx_cm_status_module
-                ON column_mappings(status, module)
-                """
-            )
-
-            cur.execute(
-                """
-                CREATE INDEX IF NOT EXISTS
-                idx_cm_norm_module
-                ON column_mappings(source_norm, module)
-                """
-            )
-
-            cur.execute(
-                """
-                CREATE INDEX IF NOT EXISTS
-                idx_cm_vector
-                ON column_mappings
-                USING ivfflat (
-                    vector vector_cosine_ops
+                ON column_mappings(
+                    status,
+                    module
                 )
                 """
             )
 
-    # --------------------------------------------------------
-    # EXACT LOOKUP
-    # --------------------------------------------------------
+            cursor.execute(
+                """
+                CREATE INDEX IF NOT EXISTS
+                idx_cm_norm_module
+                ON column_mappings(
+                    source_norm,
+                    module
+                )
+                """
+            )
 
     def exact_lookup(
         self,
@@ -896,17 +1271,17 @@ class PgVectorMappingRegistry:
         module: str = "invoices",
     ) -> dict | None:
 
-        norm = _normalize(source_column)
-
-        erp = (
-            (erp_type or "")
-            .strip()
-            .upper()
+        norm = _normalize(
+            source_column
         )
 
-        with self.conn.cursor() as cur:
+        erp = _normalize_erp(
+            erp_type
+        )
 
-            cur.execute(
+        with self.conn.cursor() as cursor:
+
+            cursor.execute(
                 """
                 SELECT
                     source_column,
@@ -918,37 +1293,52 @@ class PgVectorMappingRegistry:
                 WHERE source_norm = %s
                   AND (
                         erp_type = %s
-                        OR erp_type IS NULL
                         OR erp_type = ''
                       )
                   AND module = %s
                   AND status = 'confirmed'
-                ORDER BY confidence DESC
+                ORDER BY
+                    CASE
+                        WHEN erp_type = %s
+                        THEN 0
+                        ELSE 1
+                    END,
+                    confidence DESC
                 LIMIT 1
                 """,
                 (
                     norm,
                     erp,
                     module,
+                    erp,
                 ),
             )
 
-            row = cur.fetchone()
+            row = cursor.fetchone()
 
         if not row:
             return None
 
         return {
-            "source": row[0],
-            "udm_field": row[1],
-            "status": row[2],
-            "confidence": row[3],
-            "method": row[4],
-        }
+            "source":
+                row[0],
 
-    # --------------------------------------------------------
-    # VECTOR SEARCH
-    # --------------------------------------------------------
+            "udm_field":
+                row[1],
+
+            "status":
+                row[2],
+
+            "confidence":
+                float(
+                    row[3]
+                    or 0.0
+                ),
+
+            "method":
+                row[4]
+                or "",
+        }
 
     def vector_search(
         self,
@@ -957,74 +1347,87 @@ class PgVectorMappingRegistry:
         threshold: float = 0.55,
     ) -> dict | None:
 
-        vec_literal = _to_pgvector_literal(
-            _embed_dense(source_column)
+        vector_literal = (
+            _to_pgvector_literal(
+                _embed_dense(
+                    source_column
+                )
+            )
         )
 
-        with self.conn.cursor() as cur:
+        with self.conn.cursor() as cursor:
 
-            cur.execute(
+            cursor.execute(
                 """
                 SELECT
                     source_column,
                     udm_field,
-                    (
-                        1 - (
-                            vector <=> %s::vector
-                        )
+                    1 - (
+                        vector
+                        <=> %s::vector
                     ) AS similarity
                 FROM column_mappings
                 WHERE status = 'confirmed'
                   AND module = %s
                   AND vector IS NOT NULL
                 ORDER BY
-                    vector <=> %s::vector
+                    vector
+                    <=> %s::vector
                 LIMIT 1
                 """,
                 (
-                    vec_literal,
+                    vector_literal,
                     module,
-                    vec_literal,
+                    vector_literal,
                 ),
             )
 
-            row = cur.fetchone()
+            row = cursor.fetchone()
 
         if not row:
             return None
 
         similarity = float(
-            row[2] or 0.0
+            row[2]
+            or 0.0
         )
 
-        if similarity < threshold:
+        if (
+            similarity
+            < float(
+                threshold
+            )
+        ):
             return None
 
         return {
-            "source": row[0],
-            "udm_field": row[1],
-            "status": "confirmed",
-            "confidence": round(
-                similarity,
-                3,
-            ),
-            "method": (
-                f"vector({similarity:.0%})"
-            ),
-        }
+            "source":
+                row[0],
 
-    # --------------------------------------------------------
-    # PENDING
-    # --------------------------------------------------------
+            "udm_field":
+                row[1],
+
+            "status":
+                "confirmed",
+
+            "confidence":
+                round(
+                    similarity,
+                    3,
+                ),
+
+            "method":
+                f"vector({similarity:.0%})",
+        }
 
     def list_pending(
         self,
         module: str = "invoices",
     ) -> list[dict]:
 
-        with self.conn.cursor() as cur:
+        with self.conn.cursor() as cursor:
 
-            cur.execute(
+            cursor.execute(
                 """
                 SELECT
                     id,
@@ -1033,42 +1436,118 @@ class PgVectorMappingRegistry:
                     udm_field,
                     confidence,
                     method,
-                    created_at
+                    created_at,
+                    alternatives
                 FROM column_mappings
                 WHERE status = 'inferred'
                   AND module = %s
-                ORDER BY created_at DESC
+                ORDER BY
+                    created_at DESC,
+                    id DESC
                 """,
-                (module,),
+                (
+                    module,
+                ),
             )
 
-            rows = cur.fetchall()
+            rows = cursor.fetchall()
 
-        return [
-            {
-                "id": r[0],
-                "source_column": r[1],
-                "erp_type": r[2],
-                "udm_field": r[3],
-                "confidence": r[4],
-                "method": r[5],
-                "created_at": str(r[6]),
-            }
-            for r in rows
-        ]
+        result = []
 
-    # --------------------------------------------------------
-    # ALL
-    # --------------------------------------------------------
+        for row in rows:
+
+            raw_alternatives = row[7]
+
+            if isinstance(
+                raw_alternatives,
+                str,
+            ):
+
+                try:
+                    raw_alternatives = (
+                        json.loads(
+                            raw_alternatives
+                        )
+                    )
+                except Exception:
+                    raw_alternatives = []
+
+            alternatives = (
+                _normalize_alternatives(
+                    (
+                        raw_alternatives
+                        if isinstance(
+                            raw_alternatives,
+                            list,
+                        )
+                        else []
+                    ),
+                    row[3],
+                    float(
+                        row[4]
+                        or 0.0
+                    ),
+                    row[5]
+                    or "",
+                )
+            )
+
+            created_at = (
+                row[6].isoformat()
+                if hasattr(
+                    row[6],
+                    "isoformat",
+                )
+                else str(
+                    row[6]
+                )
+            )
+
+            result.append(
+                {
+                    "id":
+                        int(
+                            row[0]
+                        ),
+
+                    "source_column":
+                        row[1],
+
+                    "erp_type":
+                        row[2]
+                        or "",
+
+                    "udm_field":
+                        row[3],
+
+                    "confidence":
+                        float(
+                            row[4]
+                            or 0.0
+                        ),
+
+                    "method":
+                        row[5]
+                        or "",
+
+                    "created_at":
+                        created_at,
+
+                    "alternatives":
+                        alternatives,
+                }
+            )
+
+        return result
 
     def list_all(
         self,
         module: str = "invoices",
     ) -> list[dict]:
 
-        with self.conn.cursor() as cur:
+        with self.conn.cursor() as cursor:
 
-            cur.execute(
+            cursor.execute(
                 """
                 SELECT
                     id,
@@ -1086,33 +1565,73 @@ class PgVectorMappingRegistry:
                     CASE status
                         WHEN 'confirmed' THEN 0
                         WHEN 'inferred' THEN 1
-                        ELSE 2
+                        WHEN 'rejected' THEN 2
+                        ELSE 3
                     END,
-                    created_at DESC
+                    created_at DESC,
+                    id DESC
                 """,
-                (module,),
+                (
+                    module,
+                ),
             )
 
-            rows = cur.fetchall()
+            rows = cursor.fetchall()
 
-        return [
-            {
-                "id": r[0],
-                "source_column": r[1],
-                "erp_type": r[2],
-                "udm_field": r[3],
-                "status": r[4],
-                "confidence": r[5],
-                "method": r[6],
-                "approved_by": r[7],
-                "created_at": str(r[8]),
-            }
-            for r in rows
-        ]
+        result = []
 
-    # --------------------------------------------------------
-    # UPSERT
-    # --------------------------------------------------------
+        for row in rows:
+
+            created_at = (
+                row[8].isoformat()
+                if hasattr(
+                    row[8],
+                    "isoformat",
+                )
+                else str(
+                    row[8]
+                )
+            )
+
+            result.append(
+                {
+                    "id":
+                        int(
+                            row[0]
+                        ),
+
+                    "source_column":
+                        row[1],
+
+                    "erp_type":
+                        row[2]
+                        or "",
+
+                    "udm_field":
+                        row[3],
+
+                    "status":
+                        row[4],
+
+                    "confidence":
+                        float(
+                            row[5]
+                            or 0.0
+                        ),
+
+                    "method":
+                        row[6]
+                        or "",
+
+                    "approved_by":
+                        row[7],
+
+                    "created_at":
+                        created_at,
+                }
+            )
+
+        return result
 
     def upsert(
         self,
@@ -1124,26 +1643,93 @@ class PgVectorMappingRegistry:
         erp_type: str | None = None,
         module: str = "invoices",
         approved_by: str | None = None,
+        alternatives: list | None = None,
     ) -> int:
 
-        norm = _normalize(source_column)
+        source_column = (
+            source_column
+            or ""
+        ).strip()
 
-        erp = (
-            (erp_type or "")
-            .strip()
-            .upper()
+        udm_field = (
+            udm_field
+            or ""
+        ).strip()
+
+        status = (
+            status
+            or "inferred"
+        ).strip().lower()
+
+        method = (
+            method
+            or ""
+        ).strip()
+
+        module = (
+            module
+            or "invoices"
+        ).strip()
+
+        if not source_column:
+            raise ValueError(
+                "source_column is required"
+            )
+
+        if not udm_field:
+            raise ValueError(
+                "udm_field is required"
+            )
+
+        norm = _normalize(
+            source_column
         )
 
-        vec_literal = _to_pgvector_literal(
-            _embed_dense(source_column)
+        erp = _normalize_erp(
+            erp_type
         )
 
-        with self.conn.cursor() as cur:
+        confidence_value = float(
+            confidence
+            or 0.0
+        )
 
-            cur.execute(
+        vector_literal = (
+            _to_pgvector_literal(
+                _embed_dense(
+                    source_column
+                )
+            )
+        )
+
+        alternatives_json = (
+            json.dumps(
+                _normalize_alternatives(
+                    alternatives,
+                    udm_field,
+                    confidence_value,
+                    method,
+                ),
+                separators=(
+                    ",",
+                    ":",
+                ),
+            )
+        )
+
+        approved_at = (
+            datetime.now(
+                timezone.utc
+            )
+            if approved_by
+            else None
+        )
+
+        with self.conn.cursor() as cursor:
+
+            cursor.execute(
                 """
-                INSERT INTO column_mappings
-                (
+                INSERT INTO column_mappings (
                     source_column,
                     source_norm,
                     erp_type,
@@ -1153,6 +1739,7 @@ class PgVectorMappingRegistry:
                     confidence,
                     method,
                     vector,
+                    alternatives,
                     approved_by,
                     approved_at
                 )
@@ -1166,24 +1753,34 @@ class PgVectorMappingRegistry:
                     %s,
                     %s,
                     %s::vector,
+                    %s::jsonb,
                     %s,
                     %s
                 )
-
                 ON CONFLICT(
                     source_norm,
                     erp_type,
                     module
                 )
                 DO UPDATE SET
-                    udm_field = excluded.udm_field,
-                    status = excluded.status,
-                    confidence = excluded.confidence,
-                    method = excluded.method,
-                    vector = excluded.vector,
-                    approved_by = excluded.approved_by,
-                    approved_at = excluded.approved_at
-
+                    source_column =
+                        excluded.source_column,
+                    udm_field =
+                        excluded.udm_field,
+                    status =
+                        excluded.status,
+                    confidence =
+                        excluded.confidence,
+                    method =
+                        excluded.method,
+                    vector =
+                        excluded.vector,
+                    alternatives =
+                        excluded.alternatives,
+                    approved_by =
+                        excluded.approved_by,
+                    approved_at =
+                        excluded.approved_at
                 RETURNING id
                 """,
                 (
@@ -1193,29 +1790,23 @@ class PgVectorMappingRegistry:
                     module,
                     udm_field,
                     status,
-                    confidence,
+                    confidence_value,
                     method,
-                    vec_literal,
+                    vector_literal,
+                    alternatives_json,
                     approved_by,
-                    (
-                        datetime.utcnow()
-                        if approved_by
-                        else None
-                    ),
+                    approved_at,
                 ),
             )
 
-            row = cur.fetchone()
+            row = cursor.fetchone()
 
-        return (
-            int(row[0])
-            if row
-            else -1
+        if not row:
+            return -1
+
+        return int(
+            row[0]
         )
-
-    # --------------------------------------------------------
-    # APPROVE
-    # --------------------------------------------------------
 
     def approve(
         self,
@@ -1223,9 +1814,9 @@ class PgVectorMappingRegistry:
         approved_by: str = "system",
     ) -> bool:
 
-        with self.conn.cursor() as cur:
+        with self.conn.cursor() as cursor:
 
-            cur.execute(
+            cursor.execute(
                 """
                 UPDATE column_mappings
                 SET
@@ -1236,15 +1827,16 @@ class PgVectorMappingRegistry:
                 """,
                 (
                     approved_by,
-                    mapping_id,
+                    int(
+                        mapping_id
+                    ),
                 ),
             )
 
-            return cur.rowcount > 0
-
-    # --------------------------------------------------------
-    # REJECT
-    # --------------------------------------------------------
+            return (
+                cursor.rowcount
+                > 0
+            )
 
     def reject(
         self,
@@ -1252,9 +1844,9 @@ class PgVectorMappingRegistry:
         approved_by: str = "system",
     ) -> bool:
 
-        with self.conn.cursor() as cur:
+        with self.conn.cursor() as cursor:
 
-            cur.execute(
+            cursor.execute(
                 """
                 UPDATE column_mappings
                 SET
@@ -1265,24 +1857,25 @@ class PgVectorMappingRegistry:
                 """,
                 (
                     approved_by,
-                    mapping_id,
+                    int(
+                        mapping_id
+                    ),
                 ),
             )
 
-            return cur.rowcount > 0
-
-    # --------------------------------------------------------
-    # STATS
-    # --------------------------------------------------------
+            return (
+                cursor.rowcount
+                > 0
+            )
 
     def stats(
         self,
         module: str = "invoices",
     ) -> dict:
 
-        with self.conn.cursor() as cur:
+        with self.conn.cursor() as cursor:
 
-            cur.execute(
+            cursor.execute(
                 """
                 SELECT
                     status,
@@ -1291,31 +1884,31 @@ class PgVectorMappingRegistry:
                 WHERE module = %s
                 GROUP BY status
                 """,
-                (module,),
+                (
+                    module,
+                ),
             )
 
-            rows = cur.fetchall()
+            rows = cursor.fetchall()
 
         return {
-            r[0]: r[1]
-            for r in rows
+            row[0]:
+                int(
+                    row[1]
+                )
+
+            for row in rows
         }
 
-    # --------------------------------------------------------
-    # CLOSE
-    # --------------------------------------------------------
-
-    def close(self):
+    def close(
+        self,
+    ) -> None:
 
         try:
             self.conn.close()
         except Exception:
             pass
 
-
-# ============================================================
-# REGISTRY SINGLETON
-# ============================================================
 
 _registry: RegistryProtocol | None = None
 
@@ -1331,7 +1924,7 @@ def get_registry() -> RegistryProtocol:
         os.environ.get(
             "MAPPING_DB_BACKEND"
         )
-        or ""
+        or "auto"
     ).strip().lower()
 
     database_url = (
@@ -1341,40 +1934,128 @@ def get_registry() -> RegistryProtocol:
         or ""
     ).strip()
 
-    prefer_pg = (
-        backend == "pgvector"
-        or bool(database_url)
+    supported_backends = {
+        "auto",
+        "sqlite",
+        "pgvector",
+        "postgres",
+        "postgresql",
+    }
+
+    if (
+        backend
+        not in supported_backends
+    ):
+        raise RuntimeError(
+            f"Unsupported MAPPING_DB_BACKEND: {backend}"
+        )
+
+    use_postgres = (
+        backend
+        in {
+            "pgvector",
+            "postgres",
+            "postgresql",
+        }
+        or (
+            backend == "auto"
+            and bool(
+                database_url
+            )
+        )
     )
 
-    # --------------------------------------------------------
-    # PostgreSQL / pgvector
-    # --------------------------------------------------------
+    if use_postgres:
 
-    if prefer_pg and database_url:
+        if not database_url:
+            raise RuntimeError(
+                "DATABASE_URL is required when MAPPING_DB_BACKEND uses PostgreSQL"
+            )
 
         try:
 
-            _registry = PgVectorMappingRegistry(
-                database_url
+            _registry = (
+                PgVectorMappingRegistry(
+                    database_url
+                )
             )
 
             return _registry
 
         except Exception as exc:
 
-            # Do not crash the entire POC if PostgreSQL/
-            # pgvector is unavailable.
+            strict = (
+                os.environ.get(
+                    "MAPPING_DB_STRICT",
+                    "0",
+                )
+                .strip()
+                .lower()
+                in {
+                    "1",
+                    "true",
+                    "yes",
+                    "on",
+                }
+            )
+
+            if strict:
+                raise
+
             print(
                 "[MappingRegistry] "
-                "PostgreSQL backend unavailable; "
-                "falling back to SQLite: "
+                "PostgreSQL unavailable; "
+                "using SQLite fallback: "
                 f"{exc}"
             )
 
-    # --------------------------------------------------------
-    # SQLite fallback
-    # --------------------------------------------------------
-
-    _registry = SQLiteMappingRegistry()
+    _registry = (
+        SQLiteMappingRegistry()
+    )
 
     return _registry
+
+
+def reset_registry() -> None:
+
+    global _registry
+
+    if _registry is not None:
+
+        try:
+            _registry.close()
+        except Exception:
+            pass
+
+    _registry = None
+
+
+def registry_health() -> dict:
+
+    registry = get_registry()
+
+    try:
+
+        return {
+            "ok": True,
+            "backend":
+                registry.backend,
+            "stats":
+                registry.stats(),
+        }
+
+    except Exception as exc:
+
+        return {
+            "ok": False,
+            "backend":
+                getattr(
+                    registry,
+                    "backend",
+                    "unknown",
+                ),
+            "error":
+                str(
+                    exc
+                ),
+        }
